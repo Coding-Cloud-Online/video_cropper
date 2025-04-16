@@ -1,2 +1,33 @@
-venv/
+# Ignorar archivos de entorno
 .env
+
+# Ignorar archivos de video
+*.mp4
+
+# Ignorar archivos de datos generados por el script
+*.json
+
+# Ignorar directorio de clips generados
+clips/
+gpt_clips_por_partes/
+
+# Ignorar archivos temporales de MoviePy
+*.avi
+*.mov
+*.mkv
+
+# Ignorar archivos de subtítulos generados
+video_with_subtitles.mp4
+
+# Ignorar archivos de sistema
+.DS_Store
+Thumbs.db
+
+# Ignorar archivos de Python compilados
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Ignorar entorno virtual si está en el mismo repo
+venv/
+
