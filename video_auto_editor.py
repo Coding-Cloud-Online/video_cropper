@@ -175,6 +175,38 @@ def save_clips_info(clips, output_json="clips_info.json"):
     print(f"Información de clips guardada en: {output_json}")
 
 # ---------------------------
+# PASO 5: Agregar Subtítulos Directamente Sobre el Video
+# ---------------------------
+def add_subtitles_directly(video_path, transcription, output_file="video_with_subtitles.mp4"):
+    """
+    Superpone subtítulos al video usando los segmentos de la transcripción.
+    Se utiliza cada segmento para crear un TextClip con el texto correspondiente,
+    que se posiciona en la parte inferior del video.
+    """
+    video = mp.VideoFileClip(video_path)
+    subtitle_clips = []
+    
+    for segment in transcription.get("segments", []):
+        # Se crea un TextClip para cada segmento de subtítulos.
+        txt_clip = (
+            mp.TextClip(
+                segment["text"].strip(), 
+                font='Arial', 
+                fontsize=24, 
+                color='white', 
+                bg_color='black'
+            )
+            .set_position(('bottom'))
+            .set_start(segment["start"])
+            .set_duration(segment["end"] - segment["start"])
+        )
+        subtitle_clips.append(txt_clip)
+    
+    # Se superponen los clips de subtítulos sobre el video principal.
+    final_video = mp.CompositeVideoClip([video] + subtitle_clips)
+    final_video.write_videofile(output_file, codec="libx264", audio_codec="aac")
+
+# ---------------------------
 # BLOQUE PRINCIPAL
 # ---------------------------
 if __name__ == "__main__":
@@ -194,4 +226,11 @@ if __name__ == "__main__":
     print("💾 Guardando información de clips en JSON...")
     save_clips_info(clips_data, output_json="clips_info.json")
 
-    print("✅ Listo. Revisa la carpeta 'clips' y el archivo 'clips_info.json'")
+    # ---------------------------
+    # Nuevo Paso: Añadir subtítulos directamente sobre el video
+    # ---------------------------
+    print("🎞️ Añadiendo subtítulos directamente sobre el video...")
+    add_subtitles_directly(video_file, transcription, output_file="video_with_subtitles.mp4")
+    print("✅ Video con subtítulos generado: video_with_subtitles.mp4")
+    
+    print("✅ Listo. Revisa la carpeta 'clips', el archivo 'clips_info.json' y el video 'video_with_subtitles.mp4'")
