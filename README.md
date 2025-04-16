@@ -1,5 +1,3 @@
-Aquí tienes un archivo `README.md` bien estructurado para tu proyecto, explicando sus funcionalidades y cómo usarlo paso a paso:
-
 ---
 
 ### 📄 `README.md`
