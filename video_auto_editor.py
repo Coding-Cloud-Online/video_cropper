@@ -1,236 +1,288 @@
 import os
-from dotenv import load_dotenv
+import re
 import json
+from pathlib import Path
+from dotenv import load_dotenv
 import whisper
 import openai
-import moviepy.editor as mp
-import moviepy.config as mpcfg
-from pathlib import Path
+from moviepy.config import change_settings
+from moviepy.editor import (
+    VideoFileClip,
+    TextClip,
+    CompositeVideoClip,
+    concatenate_videoclips
+)
 
 # ---------------------------
-# CONFIGURATION & ENVIRONMENT
+# Configuración de rutas FFmpeg / ImageMagick
+# ---------------------------
+change_settings({
+    "FFMPEG_BINARY": r"C:\Program Files\ffmpeg-2025-04-14-git-3b2a9410ef-full_build\bin\ffmpeg.exe",
+    "IMAGEMAGICK_BINARY": r"C:\Program Files\ImageMagick-7.1.1-Q16\magick.exe"
+})
+
+# ---------------------------
+# Carga de variables de entorno
 # ---------------------------
 dotenv_path = Path(__file__).resolve().parent / ".env"
 load_dotenv(dotenv_path=dotenv_path)
-
-# Opción A: Cargar la API key desde el .env
-# openai.api_key = os.getenv("OPENAI_API_KEY")
-
-# Opción B: Hardcodear la API key para pruebas (remueve o protege la clave en producción)
-openai.api_key = "REDACTED_KEY"
-
-# (Opcional) Especifica la ruta del binario de FFmpeg si no se detecta automáticamente
-mpcfg.change_settings({"FFMPEG_BINARY": r"C:\Program Files\ffmpeg-2025-04-14-git-3b2a9410ef-full_build\bin\ffmpeg.exe"})
+openai.api_key = os.getenv("OPENAI_API_KEY")
 
 # ---------------------------
 # PASO 1: Transcripción con Whisper
 # ---------------------------
 def transcribe_audio(video_path, transcription_file="transcription.json"):
     if os.path.exists(transcription_file):
-        print(f"Cargando transcripción existente desde '{transcription_file}'...")
-        with open(transcription_file, "r", encoding="utf-8") as f:
-            return json.load(f)
-    else:
-        print("Realizando transcripción con Whisper...")
-        model = whisper.load_model("base")
-        result = model.transcribe(video_path)
-        with open(transcription_file, "w", encoding="utf-8") as f:
-            json.dump(result, f, ensure_ascii=False, indent=4)
-        return result
+        print(f"Cargando transcripción existente desde '{transcription_file}'…")
+        return json.load(open(transcription_file, "r", encoding="utf-8"))
+    print("Realizando transcripción con Whisper…")
+    model = whisper.load_model("base")
+    result = model.transcribe(video_path)
+    with open(transcription_file, "w", encoding="utf-8") as f:
+        json.dump(result, f, ensure_ascii=False, indent=4)
+    return result
 
 # ---------------------------
-# PASO 2: Extracción de Clips por Partes con GPT (con caché)
+# PASO 2: Extracción de clips por chunk con GPT
 # ---------------------------
-def extract_clips_por_partes(transcript_text, cache_dir="gpt_clips_por_partes", chunk_size=3000, start_chunk=1):
-    """
-    Procesa la transcripción en partes de tamaño 'chunk_size'.
-    'start_chunk' es 1-indexado (p. ej., start_chunk=2 omite el primer chunk).
-    """
+def extract_clips_por_partes(transcript_text, cache_dir="gpt_clips_por_partes", chunk_size=3000):
     os.makedirs(cache_dir, exist_ok=True)
     clips_totales = []
     total = len(transcript_text)
-    num_chunk = (total // chunk_size) + (1 if total % chunk_size != 0 else 0)
-    print(f"Se procesarán {num_chunk} segmento(s) en total...")
-    
-    for i in range(start_chunk - 1, num_chunk):
-        start_index = i * chunk_size
-        chunk = transcript_text[start_index:start_index+chunk_size]
-        chunk_index = i + 1
-        cache_file = os.path.join(cache_dir, f"gpt_clips_part_{chunk_index}.json")
-        
+    num_chunk = (total // chunk_size) + (1 if total % chunk_size else 0)
+
+    for i in range(num_chunk):
+        idx = i + 1
+        cache_file = os.path.join(cache_dir, f"clip_chunk_{idx}.json")
         if os.path.exists(cache_file):
-            print(f"Cargando clips de caché para el segmento {chunk_index} desde '{cache_file}'...")
-            with open(cache_file, "r", encoding="utf-8") as f:
-                clips = json.load(f)
-        else:
-            prompt = f"""
-A continuación tienes la transcripción de un video en el que se mezcla una canción con la narración de "Isaias Cabrera" (yo, programador). En este video, mientras programo, se escucha un DJ set. Analiza la transcripción y regresa una lista de clips interesantes que tengan sentido en este contexto.
+            clips_totales.append(json.load(open(cache_file, "r", encoding="utf-8")))
+            continue
 
-Cada clip debe ser un objeto JSON con las siguientes claves EXACTAS:
-- "title": un título breve del clip.
-- "start": timestamp de inicio en segundos (número).
-- "end": timestamp de fin en segundos (número).
-- "resumen": un resumen breve del clip.
+        chunk = transcript_text[i*chunk_size:(i+1)*chunk_size]
+        prompt = f"""
+Tienes la transcripción de un video. Divídela en chunks de {chunk_size} caracteres y para cada chunk regresa UNA LISTA JSON de tamaño 1 con:
+- \"title\": título descriptivo,
+- \"start\": segundo de inicio,
+- \"end\": segundo de fin,
+- \"resumen\": breve descripción.
+Cada clip debe durar al menos 180 segundos (3 min) y como máximo 300 segundos (5 min).
 
-**Importante:** Cada clip debe tener una duración mínima de 90 segundos (es decir, "end" - "start" debe ser al menos 90).
-
-Devuelve solamente un array de estos objetos JSON. No incluyas comentarios adicionales.
-Texto:
+Chunk #{idx}:
 {chunk}
 """
-            response = openai.ChatCompletion.create(
-                model="gpt-4",
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.4
-            )
-            result = response.choices[0].message.content
-            try:
-                clips = json.loads(result)
-                # Normalización de claves en caso de nombres alternativos
-                for clip in clips:
-                    if "timestamp inicio" in clip and "start" not in clip:
-                        clip["start"] = clip.pop("timestamp inicio")
-                    if "timestamp fin" in clip and "end" not in clip:
-                        clip["end"] = clip.pop("timestamp fin")
-                    if "título" in clip and "title" not in clip:
-                        clip["title"] = clip.pop("título")
-                with open(cache_file, "w", encoding="utf-8") as f:
-                    json.dump(clips, f, ensure_ascii=False, indent=4)
-            except json.JSONDecodeError:
-                print(f"Error al parsear JSON para el segmento {chunk_index}. Resultado:")
-                print(result)
-                clips = []
-        clips_totales.extend(clips)
+        resp = openai.ChatCompletion.create(
+            model="gpt-4",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.4
+        )
+        clip = json.loads(resp.choices[0].message.content)[0]
+        with open(cache_file, "w", encoding="utf-8") as f:
+            json.dump(clip, f, ensure_ascii=False, indent=4)
+        clips_totales.append(clip)
+
     return clips_totales
 
 # ---------------------------
-# PASO 3: Crear Subclips con MoviePy (mínimo 60 segundos)
+# PASO 3: Crear subclips limpios + subtítulos verticales
 # ---------------------------
-def create_clips(video_path, clips, min_duration=60, padding=5):
-    video = mp.VideoFileClip(video_path)
-    os.makedirs("clips", exist_ok=True)
-    
-    for idx, clip in enumerate(clips):
-        if "start" not in clip or "end" not in clip or "title" not in clip:
-            print(f"Clip {idx} missing required keys: {clip}")
-            continue
-        
-        start = clip["start"]
-        end = clip["end"]
-        
-        # Primer intento: agregar padding (opcional) y asegurar duración mínima
-        new_start = max(0, start - padding)
-        new_end = min(video.duration, end + padding)
-        duration = new_end - new_start
-        if duration < min_duration:
-            delta = min_duration - duration
-            # Intenta extender hacia adelante
-            new_end = min(video.duration, new_end + delta)
-            # Si aún no alcanza, extiende hacia atrás (sin pasar de 0)
-            if new_end - new_start < min_duration:
-                new_start = max(0, new_start - (min_duration - (new_end - new_start)))
-        
-        print(f"Creando subclip {idx+1} desde {new_start} hasta {new_end} (duración {new_end-new_start} segundos)...")
-        subclip = video.subclip(new_start, new_end)
-        output_path = f"clips/clip_{idx+1}.mp4"
-        subclip.write_videofile(output_path, codec="libx264", audio_codec="aac")
+def create_clean_clips(video_path, clips, transcription,
+                       min_duration=180, max_duration=300,
+                       padding=60, silence_thresh=0.5):
+    video    = VideoFileClip(video_path)
+    segments = transcription.get("segments", [])
 
-# ---------------------------
-# PASO 4: Generar y Guardar Información de Clips con Copy para Redes
-# ---------------------------
-def generate_social_copy(title, resumen, existing_copies):
-    """
-    Genera un copy para redes con base en el título y resumen.
-    Se asegura de no repetir un copy ya existente agregando variación si es necesario.
-    """
-    base = f"🎬 {title}"
-    if resumen.strip():
-        base += f" - {resumen}"
-    copy_text = base + " ¡No te lo pierdas!"
-    
-    # Si ya existe, se le agregan variaciones hasta que sea único
-    while copy_text in existing_copies:
-        copy_text += " 😊"
-    return copy_text
+    # Estilo de subtítulos para vertical
+    screen_w, screen_h     = video.size
+    subtitle_fontsize      = 60
+    subtitle_margin_bottom = 50
+    subtitle_text_width    = int(screen_w * 0.9)
 
-def save_clips_info(clips, output_json="clips_info.json"):
-    """
-    Genera y guarda un archivo JSON con la información de cada clip:
-    id, título y copy para post en redes.
-    """
-    clips_info = []
-    existing_copies = set()
-    
+    # Regex muletillas
+    filler_words   = ["eh", "um", "ah", "bueno", "o sea", "pues", "este"]
+    filler_pattern = re.compile(r"\b(" + "|".join(filler_words) + r")\b", re.IGNORECASE)
+
+    os.makedirs("clips_clean", exist_ok=True)
+
     for idx, clip in enumerate(clips, start=1):
-        title = clip.get("title", f"Clip {idx}")
-        resumen = clip.get("resumen", "").strip()
-        copy_text = generate_social_copy(title, resumen, existing_copies)
-        existing_copies.add(copy_text)
-        
-        clip_info = {"id": idx, "title": title, "copy": copy_text}
-        clips_info.append(clip_info)
-    
-    with open(output_json, "w", encoding="utf-8") as f:
-        json.dump(clips_info, f, ensure_ascii=False, indent=4)
-    print(f"Información de clips guardada en: {output_json}")
+        title      = clip.get("title", f"chunk_{idx}")
+        start, end = clip["start"], clip["end"]
+        new_start  = max(0, start - padding)
+        new_end    = min(video.duration, end + padding)
+
+        # Filtrar segmentos dentro del rango
+        segs = [s for s in segments if new_start <= s["start"] < s["end"] <= new_end]
+
+        # Detectar muletillas y silencios
+        removal = []
+        for s in segs:
+            if filler_pattern.search(s["text"]):
+                removal.append((s["start"], s["end"]))
+        times = sorted(segs, key=lambda s: s["start"])
+        if times and (times[0]["start"] - new_start) > silence_thresh:
+            removal.append((new_start, times[0]["start"]))
+        for a, b in zip(times, times[1:]):
+            if b["start"] - a["end"] > silence_thresh:
+                removal.append((a["end"], b["start"]))
+        if times and new_end - times[-1]["end"] > silence_thresh:
+            removal.append((times[-1]["end"], new_end))
+
+        # Unir intervalos solapados
+        removal.sort(key=lambda x: x[0])
+        merged = []
+        for rs, re_end in removal:
+            if not merged or rs > merged[-1][1]:
+                merged.append([rs, re_end])
+            else:
+                merged[-1][1] = max(merged[-1][1], re_end)
+
+        # Calcular tramos a mantener
+        keeps, cursor = [], new_start
+        for rs, re_end in merged:
+            if cursor < rs:
+                keeps.append((cursor, rs))
+            cursor = re_end
+        if cursor < new_end:
+            keeps.append((cursor, new_end))
+
+        # Forzar duraciones
+        total_keep = sum(e - s for s, e in keeps)
+        if total_keep < min_duration:
+            keeps = [(new_start, new_start + min_duration)]
+        elif total_keep > max_duration:
+            adjusted, acc = [], 0
+            for s, e in keeps:
+                dur = e - s
+                if acc + dur <= max_duration:
+                    adjusted.append((s, e))
+                    acc += dur
+                else:
+                    adjusted.append((s, s + (max_duration - acc)))
+                    break
+            keeps = adjusted
+
+        # Concatenar subclips
+        subclips   = [video.subclip(s, e) for s, e in keeps]
+        chunk_clip = concatenate_videoclips(subclips, method="compose")
+
+        # Subtítulos ajustados
+        durations = [e - s for s, e in keeps]
+        offsets   = [0]
+        for d in durations[:-1]:
+            offsets.append(offsets[-1] + d)
+
+        subtitle_clips = []
+        for s in segs:
+            if filler_pattern.search(s["text"]):
+                continue
+            for (ks, ke), off in zip(keeps, offsets):
+                if ks <= s["start"] < ke:
+                    rel_t = (s["start"] - ks) + off
+                    txt = (TextClip(
+                                s["text"].strip(),
+                                font="Arial",
+                                fontsize=subtitle_fontsize,
+                                color="white",
+                                bg_color="black",
+                                size=(subtitle_text_width, None),
+                                method="caption"
+                            )
+                            .margin(bottom=subtitle_margin_bottom, opacity=0)
+                            .set_position(("center", "bottom"))
+                            .set_start(rel_t)
+                            .set_duration(s["end"] - s["start"]))
+                    subtitle_clips.append(txt)
+                    break
+
+        final_clip = CompositeVideoClip([chunk_clip, *subtitle_clips])
+        safe_title = "".join(
+            c if c.isalnum() or c in (" ", "_", "-") else "_"
+            for c in title
+        ).strip().replace(" ", "_")
+        out_path = f"clips_clean/{safe_title}.mp4"
+        final_clip.write_videofile(out_path, codec="libx264", audio_codec="aac")
 
 # ---------------------------
-# PASO 5: Agregar Subtítulos Directamente Sobre el Video
+# PASO 4: Guardar info para redes e índice
 # ---------------------------
-def add_subtitles_directly(video_path, transcription, output_file="video_with_subtitles.mp4"):
-    """
-    Superpone subtítulos al video usando los segmentos de la transcripción.
-    Se utiliza cada segmento para crear un TextClip con el texto correspondiente,
-    que se posiciona en la parte inferior del video.
-    """
-    video = mp.VideoFileClip(video_path)
-    subtitle_clips = []
-    
-    for segment in transcription.get("segments", []):
-        # Se crea un TextClip para cada segmento de subtítulos.
-        txt_clip = (
-            mp.TextClip(
-                segment["text"].strip(), 
-                font='Arial', 
-                fontsize=24, 
-                color='white', 
-                bg_color='black'
-            )
-            .set_position(('bottom'))
-            .set_start(segment["start"])
-            .set_duration(segment["end"] - segment["start"])
-        )
-        subtitle_clips.append(txt_clip)
-    
-    # Se superponen los clips de subtítulos sobre el video principal.
-    final_video = mp.CompositeVideoClip([video] + subtitle_clips)
-    final_video.write_videofile(output_file, codec="libx264", audio_codec="aac")
+def save_clips_info(clips, output_json="clips_info.json"):
+    info, seen = [], set()
+    for i, c in enumerate(clips, start=1):
+        base = f"🎬 {c['title']} - {c.get('resumen','')}"
+        copy = (base + " ¡No te lo pierdas!").strip()
+        while copy in seen:
+            copy += " 😊"
+        seen.add(copy)
+        info.append({"id": i, "title": c['title'], "copy": copy})
+    with open(output_json, "w", encoding="utf-8") as f:
+        json.dump(info, f, ensure_ascii=False, indent=4)
+
+
+def save_index_txt(clips, filename="clips_index.txt"):
+    lines = []
+    for i, c in enumerate(clips, start=1):
+        m, s = divmod(int(c["start"]), 60)
+        lines.append(f"{i}. [{m:02d}:{s:02d}] - {c['title']}")
+    with open(filename, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+
+# ---------------------------
+# PASO 5: Generar resumen final de subclips
+# ---------------------------
+def generate_final_summary(clips_info_file="clips_info.json", clips_dir="clips_clean"):
+    # Cargar info de clips
+    clips_info = json.load(open(clips_info_file, "r", encoding="utf-8"))
+    entries = [f"{c['id']}. {c['title']} - {c['copy']}" for c in clips_info]
+    prompt = (
+        "Estos son los clips generados:\n" + "\n".join(entries) +
+        "\n\nDevuélveme **solo** un array JSON de nombres de archivos (sin ruta) de los clips "
+        "que mejor resuman el video, en orden lógico, eligiendo entre 5 y 10 clips."
+    )
+    resp = openai.ChatCompletion.create(
+        model="gpt-4",
+        messages=[{"role":"user","content":prompt}],
+        temperature=0.3
+    )
+    content = resp.choices[0].message.content
+    m = re.search(r"\[.*\]", content, re.DOTALL)
+    if m:
+        try:
+            names = json.loads(m.group(0))
+        except json.JSONDecodeError:
+            names = sorted(os.listdir(clips_dir))[:5]
+    else:
+        names = sorted(os.listdir(clips_dir))[:5]
+
+    # Concatenar
+    subclips = []
+    for name in names:
+        path = os.path.join(clips_dir, name)
+        subclips.append(VideoFileClip(path))
+    final = concatenate_videoclips(subclips, method="compose")
+    os.makedirs("output", exist_ok=True)
+    final.write_videofile("output/final_summary.mp4", codec="libx264", audio_codec="aac")
+    print("✅ Final summary generado en output/final_summary.mp4")
 
 # ---------------------------
 # BLOQUE PRINCIPAL
 # ---------------------------
 if __name__ == "__main__":
-    video_file = "video.mp4"
-    
-    print("🎧 Transcribiendo...")
-    transcription = transcribe_audio(video_file)
-    transcript_text = transcription["text"]
+    video_file     = "video.mp4"
+    transcription  = transcribe_audio(video_file)
+    transcript_text= transcription.get("text", "")
 
-    # Puedes ajustar 'start_chunk' para omitir segmentos ya procesados.
-    print("📚 Extrayendo clips con GPT por partes...")
-    clips_data = extract_clips_por_partes(transcript_text, chunk_size=3000, start_chunk=1)
+    print("Extrayendo clips por chunk…")
+    clips_data     = extract_clips_por_partes(transcript_text)
 
-    print("✂️ Generando subclips (mínimo 60 segundos)...")
-    create_clips(video_file, clips_data, min_duration=60, padding=5)
-    
-    print("💾 Guardando información de clips en JSON...")
-    save_clips_info(clips_data, output_json="clips_info.json")
+    print("Creando videos limpios por chunk…")
+    create_clean_clips(video_file, clips_data, transcription)
 
-    # ---------------------------
-    # Nuevo Paso: Añadir subtítulos directamente sobre el video
-    # ---------------------------
-    print("🎞️ Añadiendo subtítulos directamente sobre el video...")
-    add_subtitles_directly(video_file, transcription, output_file="video_with_subtitles.mp4")
-    print("✅ Video con subtítulos generado: video_with_subtitles.mp4")
-    
-    print("✅ Listo. Revisa la carpeta 'clips', el archivo 'clips_info.json' y el video 'video_with_subtitles.mp4'")
+    print("Guardando info para redes…")
+    save_clips_info(clips_data)
+
+    print("Guardando índice para YouTube…")
+    save_index_txt(clips_data)
+
+    print("✅ Proceso completado de subclips.")
+    print("Generando resumen final de subclips…")
+    generate_final_summary()
+    print("✅ Proceso completo.")

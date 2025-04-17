@@ -9,6 +9,7 @@
 
 # Ignorar directorio de clips generados
 clips/
+clips_clean/
 gpt_clips_por_partes/
 
 # Ignorar archivos temporales de MoviePy
